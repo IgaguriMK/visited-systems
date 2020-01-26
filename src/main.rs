@@ -1,12 +1,17 @@
+mod edsm_api;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::env::var;
-use std::fs::{create_dir, read_dir, write, File};
+use std::fs::{copy, create_dir, read_dir, write, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Error};
+use clap::{App, Arg, ArgMatches, SubCommand};
 use serde::Deserialize;
 use serde_json::from_str;
+
+use edsm_api::API;
 
 fn main() {
     if let Err(e) = w_main() {
@@ -16,38 +21,43 @@ fn main() {
 }
 
 fn w_main() -> Result<(), Error> {
-    let home = var("USERPROFILE").context("環境変数 USERPROFILE がありません。")?;
+    let matches = App::new("visited-systems")
+        .about("ジャーナルファイルからVisited stars修正用のImportStars.txtを作成する。")
+        .subcommand(
+            SubCommand::with_name("check-dump")
+                .about("ImportStars.txtから読み込まれていないジャーナルファイルを列挙する。")
+                .arg(
+                    Arg::with_name("cmdr")
+                        .required(true)
+                        .takes_value(true)
+                        .help("Commander name."),
+                )
+                .arg(
+                    Arg::with_name("dump_file")
+                        .required(true)
+                        .takes_value(true)
+                        .help("入力の 'ImportStars.txt'"),
+                ),
+        )
+        .get_matches();
+    if let Some(matches) = matches.subcommand_matches("check-dump") {
+        check_dump(matches)
+    } else {
+        main_cmd()
+    }
+}
 
-    let journal_dir = PathBuf::from(home)
-        .join("Saved Games")
-        .join("Frontier Developments")
-        .join("Elite Dangerous");
-
+fn main_cmd() -> Result<(), Error> {
     let mut visited_sets = BTreeMap::<String, BTreeSet<String>>::new();
     let mut cmdr_ids = BTreeMap::<String, String>::new();
 
-    for node in read_dir(&journal_dir)
-        .with_context(|| format!("フォルダ {:?} が開けません。", journal_dir))?
-    {
-        let node = node?;
-
-        if !node.file_type()?.is_file() {
-            continue;
+    for info in read_files()? {
+        if let Some(id) = info.user_id {
+            cmdr_ids.insert(info.cmdr.clone(), id);
         }
 
-        let fname = node.file_name();
-        let file_name = fname.to_string_lossy();
-        if file_name.starts_with("Journal.") && file_name.ends_with(".log") {
-            eprintln!("読み込み中: {}", file_name);
-            let info = read_file(&node.path())?;
-
-            if let Some(id) = info.user_id {
-                cmdr_ids.insert(info.cmdr.clone(), id);
-            }
-
-            let set = visited_sets.entry(info.cmdr).or_insert_with(BTreeSet::new);
-            set.extend(info.systems.into_iter());
-        }
+        let set = visited_sets.entry(info.cmdr).or_insert_with(BTreeSet::new);
+        set.extend(info.systems.into_iter());
     }
 
     let out_path = PathBuf::from("./outputs");
@@ -91,6 +101,86 @@ fn w_main() -> Result<(), Error> {
     Ok(())
 }
 
+fn check_dump(matches: &ArgMatches) -> Result<(), Error> {
+    let cmdr = matches.value_of("cmdr").expect("arg 'cmdr' should be set");
+
+    let input_path = matches
+        .value_of("dump_file")
+        .expect("arg 'dump_file' should be set");
+    let f = File::open(input_path).context("星系リストファイルを開けません。")?;
+    let r = BufReader::new(f);
+
+    let mut listed_systems = BTreeSet::new();
+    for line in r.lines() {
+        let line = line?;
+        listed_systems.insert(line.to_uppercase());
+    }
+
+    let out_path = PathBuf::from("./missing_journals");
+    if !out_path.exists() {
+        create_dir(&out_path)
+            .with_context(|| format!("出力ディレクトリ {:?} の作成に失敗しました。", out_path))?;
+    }
+
+    let mut api = API::new();
+
+    for info in read_files()? {
+        if info.cmdr != cmdr {
+            continue;
+        }
+
+        for sys in &info.systems {
+            let system_name_cap = sys.to_uppercase();
+            if !listed_systems.contains(&system_name_cap) {
+                if api.check_moved(sys)? {
+                    continue;
+                }
+
+                eprintln!("Missing: {}", sys);
+                let to_path = out_path.join(
+                    info.path
+                        .file_name()
+                        .expect("journal file path should have file name"),
+                );
+                copy(&info.path, &to_path).context("ファイルのコピーに失敗しました。")?;
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn read_files() -> Result<Vec<ScanInfo>, Error> {
+    let home = var("USERPROFILE").context("環境変数 USERPROFILE がありません。")?;
+
+    let journal_dir = PathBuf::from(home)
+        .join("Saved Games")
+        .join("Frontier Developments")
+        .join("Elite Dangerous");
+
+    let mut infos = Vec::new();
+    for node in read_dir(&journal_dir)
+        .with_context(|| format!("フォルダ {:?} が開けません。", journal_dir))?
+    {
+        let node = node?;
+
+        if !node.file_type()?.is_file() {
+            continue;
+        }
+
+        let fname = node.file_name();
+        let file_name = fname.to_string_lossy();
+        if file_name.starts_with("Journal.") && file_name.ends_with(".log") {
+            eprintln!("読み込み中: {}", file_name);
+            let info = read_file(&node.path())?;
+            infos.push(info);
+        }
+    }
+
+    Ok(infos)
+}
+
 fn read_file(path: &Path) -> Result<ScanInfo, Error> {
     let f = File::open(path).with_context(|| format!("ファイル {:?} が開けません", path))?;
     let r = BufReader::new(f);
@@ -118,6 +208,7 @@ fn read_file(path: &Path) -> Result<ScanInfo, Error> {
     }
 
     Ok(ScanInfo {
+        path: path.to_owned(),
         cmdr,
         user_id,
         systems,
@@ -125,6 +216,7 @@ fn read_file(path: &Path) -> Result<ScanInfo, Error> {
 }
 
 struct ScanInfo {
+    path: PathBuf,
     cmdr: String,
     user_id: Option<String>,
     systems: Vec<String>,
